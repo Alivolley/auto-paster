@@ -12,7 +12,7 @@ from pywinauto.findwindows import ElementNotFoundError
 class AutoPasterApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("AutoPaster v8.0")
+        self.root.title("AutoPaster v9.0 (Optimized)")
         self.root.geometry("450x250")
         self.root.resizable(False, False)
 
@@ -129,7 +129,7 @@ class AutoPasterApp:
             except queue.Empty: continue
 
     def clipboard_worker(self, worker_run_id, initial_clipboard, target_title):
-        for _ in range(40):
+        for _ in range(50): # Polling for ~7.5 seconds
             if not self.is_running or worker_run_id != self.run_id_counter:
                 return
             
@@ -137,7 +137,7 @@ class AutoPasterApp:
             if new_clipboard_content and new_clipboard_content != initial_clipboard:
                 self.paste_in_target_tab(new_clipboard_content, target_title)
                 return
-            time.sleep(0.2)
+            time.sleep(0.15) # OPTIMIZED
 
     def perform_paste_action(self, text_to_paste, target_window):
         try:
@@ -147,7 +147,7 @@ class AutoPasterApp:
             relative_y = client_rect.height() - 125
             
             target_window.click_input(coords=(relative_x, relative_y))
-            time.sleep(0.15)
+            time.sleep(0.1) # OPTIMIZED
             
             original_clipboard = pyperclip.paste()
             pyperclip.copy(text_to_paste)
@@ -155,7 +155,7 @@ class AutoPasterApp:
             pyautogui.press('space')
             pyautogui.hotkey('ctrl', 'v')
             
-            time.sleep(0.1)
+            time.sleep(0.05) # OPTIMIZED
             pyautogui.hotkey('ctrl', 'end')
             pyperclip.copy(original_clipboard)
         except Exception as e:
@@ -187,7 +187,7 @@ class AutoPasterApp:
                 for window in chrome_windows:
                     if window.is_minimized():
                         window.restore()
-                        time.sleep(0.25)
+                        time.sleep(0.2) # OPTIMIZED
                     
                     window.set_focus()
                     
@@ -198,7 +198,7 @@ class AutoPasterApp:
                     
                     for _ in range(30):
                         pyautogui.hotkey('ctrl', 'tab')
-                        time.sleep(0.12)
+                        time.sleep(0.09) # OPTIMIZED
                         current_title = window.window_text()
                         if target_title_lower in current_title.lower():
                             target_window = window
