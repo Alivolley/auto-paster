@@ -1,0 +1,5 @@
+pyperclip==1.9.0
+pyautogui==0.9.54
+pynput==1.8.1
+pywinauto==0.6.9
+
