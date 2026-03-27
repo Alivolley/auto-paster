@@ -144,7 +144,7 @@ class AutoPasterApp:
             target_window.set_focus()
             client_rect = target_window.client_rect()
             relative_x = client_rect.width() // 2
-            relative_y = client_rect.height() - 125
+            relative_y = client_rect.height() - 52
             
             target_window.click_input(coords=(relative_x, relative_y))
             time.sleep(0.1)
