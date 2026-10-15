@@ -1,13 +1,25 @@
 import tkinter as tk
 from tkinter import messagebox
 import time
+import ctypes
 import pyperclip
 import threading
 import queue
 import pyautogui
+import win32gui
 from pynput import keyboard
-from pywinauto import Desktop, timings
+from pywinauto import timings
+from pywinauto.controls.hwndwrapper import HwndWrapper
+from pywinauto.win32_element_info import HwndElementInfo
 from pywinauto.findwindows import ElementNotFoundError
+
+user32 = ctypes.windll.user32
+user32.GetClipboardSequenceNumber.restype = ctypes.c_ulong
+
+CHROME_CLASS = 'Chrome_WidgetWin_1'
+CLIPBOARD_WAIT = 50 * 0.15   # Same ~7.5 s window as the old 50 x 0.15 s polling loop
+TAB_SWITCH_WAIT = 0.19       # Old per-tab wait: sleep(0.09) + pyautogui's implicit 0.1 s pause
+RESTORE_WAIT = 0.2
 
 class AutoPasterApp:
     def __init__(self, root):
@@ -17,6 +29,8 @@ class AutoPasterApp:
         self.root.resizable(False, False)
 
         timings.Timings.fast()
+        # pyautogui sleeps 0.1 s after every call by default; the needed waits are explicit below.
+        pyautogui.PAUSE = 0
 
         self.is_running = False
         self.listener_thread = None
@@ -129,15 +143,26 @@ class AutoPasterApp:
             except queue.Empty: continue
 
     def clipboard_worker(self, worker_run_id, initial_clipboard, target_title):
-        for _ in range(50):
+        # The clipboard sequence number changes on every clipboard write and is free to read,
+        # so the clipboard itself is only opened when something actually changed.
+        deadline = time.monotonic() + CLIPBOARD_WAIT
+        last_sequence = None
+        while True:
             if not self.is_running or worker_run_id != self.run_id_counter:
                 return
-            
-            new_clipboard_content = pyperclip.paste()
-            if new_clipboard_content and new_clipboard_content != initial_clipboard:
-                self.paste_in_target_tab(new_clipboard_content, target_title)
+
+            sequence = user32.GetClipboardSequenceNumber()
+            if sequence != last_sequence or sequence == 0:
+                last_sequence = sequence
+                new_clipboard_content = pyperclip.paste()
+                if new_clipboard_content and new_clipboard_content != initial_clipboard:
+                    self.paste_in_target_tab(new_clipboard_content, target_title)
+                    return
+
+            if time.monotonic() >= deadline:
                 return
-            time.sleep(0.15)
+            # A sequence number of 0 means it is unavailable; fall back to the old 0.15 s polling.
+            time.sleep(0.15 if sequence == 0 else 0.01)
 
     def perform_paste_action(self, text_to_paste, target_window):
         try:
@@ -145,8 +170,8 @@ class AutoPasterApp:
             client_rect = target_window.client_rect()
             relative_x = client_rect.width() // 2
             relative_y = client_rect.height() - 52
-            
-            target_window.click_input(coords=(relative_x, relative_y))
+
+            target_window.click_input(coords=(relative_x, relative_y), use_log=False)
             time.sleep(0.1)
 
             # --- CRITICAL LOGIC FIX ---
@@ -161,66 +186,101 @@ class AutoPasterApp:
             original_clipboard = pyperclip.paste()
             pyperclip.copy(text_to_paste)
             pyautogui.hotkey('ctrl', 'v')
-            
+
             # 4. Restore the original clipboard content.
-            pyperclip.copy(original_clipboard)
+            # Usually it is the same text that was just copied, so the clipboard already holds it.
+            # Otherwise give Chrome the same 0.1 s as before to read it before overwriting.
+            if original_clipboard != text_to_paste:
+                time.sleep(0.1)
+                pyperclip.copy(original_clipboard)
 
         except Exception as e:
             error_message = f"An error occurred during paste action:\n{e}"
             self.root.after(0, lambda: messagebox.showerror("Paste Error", error_message))
 
+    def find_chrome_windows(self):
+        # Same windows, in the same Z-order, as Desktop(backend="win32").windows(class_name=..., top_level_only=True)
+        handles = []
+        def collect(hwnd, _):
+            try:
+                if win32gui.GetClassName(hwnd) == CHROME_CLASS:
+                    handles.append(hwnd)
+            except Exception:
+                pass
+            return True
+        win32gui.EnumWindows(collect, None)
+        return handles
+
+    def wait_until_restored(self, hwnd):
+        deadline = time.monotonic() + RESTORE_WAIT
+        while user32.IsIconic(hwnd) and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+    def wait_for_title_change(self, window, previous_title):
+        # Read the title as soon as Chrome switches tabs, but never wait longer than before.
+        deadline = time.monotonic() + TAB_SWITCH_WAIT
+        current_title = window.window_text()
+        while current_title == previous_title and time.monotonic() < deadline:
+            time.sleep(0.005)
+            current_title = window.window_text()
+        return current_title
+
     def paste_in_target_tab(self, text_to_paste, target_title):
         target_window = None
         target_title_lower = target_title.lower()
 
-        if self.cached_chrome_window:
-            try:
-                if hasattr(self.cached_chrome_window, 'exists') and self.cached_chrome_window.exists():
-                    if self.cached_chrome_window.class_name() == 'Chrome_WidgetWin_1':
-                        if target_title_lower in self.cached_chrome_window.window_text().lower():
-                            target_window = self.cached_chrome_window
-            except Exception:
-                 self.cached_chrome_window = None
-        
-        if not target_window:
-            try:
-                desktop = Desktop(backend="win32")
-                chrome_windows = desktop.windows(class_name="Chrome_WidgetWin_1", top_level_only=True)
-                
-                if not chrome_windows:
-                    self.root.after(0, lambda: messagebox.showerror("Chrome Error", "No Chrome window found."))
-                    return
-                
-                for window in chrome_windows:
+        try:
+            chrome_handles = self.find_chrome_windows()
+
+            if not chrome_handles:
+                self.root.after(0, lambda: messagebox.showerror("Chrome Error", "No Chrome window found."))
+                return
+
+            # Fast path: a window (any profile) already showing the target tab. Topmost = most recently used.
+            # Only titles are read here: nothing is focused and no keys are sent.
+            for hwnd in chrome_handles:
+                if target_title_lower in win32gui.GetWindowText(hwnd).lower():
+                    target_window = HwndWrapper(HwndElementInfo(hwnd))
+                    break
+
+            if not target_window:
+                # Cycle through tabs, starting with the window the last paste went to.
+                if self.cached_chrome_window in chrome_handles:
+                    chrome_handles.remove(self.cached_chrome_window)
+                    chrome_handles.insert(0, self.cached_chrome_window)
+
+                for hwnd in chrome_handles:
+                    window = HwndWrapper(HwndElementInfo(hwnd))
                     if window.is_minimized():
                         window.restore()
-                        time.sleep(0.2)
-                    
+                        self.wait_until_restored(hwnd)
+
                     window.set_focus()
-                    
+
                     initial_title = window.window_text()
                     if target_title_lower in initial_title.lower():
                         target_window = window
                         break
-                    
+
+                    previous_title = initial_title
                     for _ in range(30):
                         pyautogui.hotkey('ctrl', 'tab')
-                        time.sleep(0.09)
-                        current_title = window.window_text()
+                        current_title = self.wait_for_title_change(window, previous_title)
                         if target_title_lower in current_title.lower():
                             target_window = window
                             break
                         if current_title == initial_title:
                             break
+                        previous_title = current_title
                     if target_window:
                         break
-            except Exception as e:
-                error_message = f"Error during window search:\n{e}"
-                self.root.after(0, lambda: messagebox.showerror("Search Error", error_message))
-                return
+        except Exception as e:
+            error_message = f"Error during window search:\n{e}"
+            self.root.after(0, lambda: messagebox.showerror("Search Error", error_message))
+            return
 
         if target_window:
-            self.cached_chrome_window = target_window
+            self.cached_chrome_window = target_window.handle
             self.perform_paste_action(text_to_paste, target_window)
         else:
             self.root.after(0, lambda: messagebox.showinfo("Tab Not Found", f"Could not find tab '{target_title}'."))
